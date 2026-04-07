@@ -113,7 +113,7 @@ void FileBrowserActivity::onEnter() {
   auto root = Storage.open(basepath.c_str());
   if (!root) {
     basepath = "/";
-  } else if (!root.isDirectory()){
+  } else if (!root.isDirectory()) {
     root.close();
     lockLongPressBack = true;
 
@@ -147,7 +147,8 @@ void FileBrowserActivity::clearFileMetadata(const std::string& fullPath) {
 
 void FileBrowserActivity::loop() {
   // Long press BACK (1s+) goes to root folder
-  // but Long press BACK (1s+) from ReaderActivity sends us here with the MappedInput already set. So ignore it the first time. 
+  // but Long press BACK (1s+) from ReaderActivity sends us here with the MappedInput already set. 
+  // So ignore it the first time. 
   if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= GO_HOME_MS &&
       basepath != "/" && !lockLongPressBack) {
     basepath = "/";
@@ -161,7 +162,7 @@ void FileBrowserActivity::loop() {
     lockLongPressBack = false;
     return;
   }
-
+  
   const int pageItems = UITheme::getInstance().getNumberOfItemsPerPage(renderer, true, false, true, false);
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
