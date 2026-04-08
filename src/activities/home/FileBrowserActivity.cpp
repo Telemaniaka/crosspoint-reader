@@ -119,8 +119,7 @@ void FileBrowserActivity::onEnter() {
     lockLongPressBack = true;
 
     const std::string oldPath = basepath;
-    basepath.replace(basepath.find_last_of('/'), std::string::npos, "");
-    if (basepath.empty()) basepath = "/";
+    basepath = FsHelpers::extractFolderPath(basepath);
     loadFiles();
 
     const auto pos = oldPath.find_last_of('/');
