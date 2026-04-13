@@ -1,6 +1,7 @@
 #include "BmpViewerActivity.h"
 
 #include <Bitmap.h>
+#include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -11,8 +12,75 @@
 BmpViewerActivity::BmpViewerActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string path)
     : Activity("BmpViewer", renderer, mappedInput), filePath(std::move(path)) {}
 
+
+void BmpViewerActivity::loadSiblingFiles() {
+  siblingFiles.clear();
+  currentIndex = 0;
+
+  const auto folderPath = FsHelpers::extractFolderPath(filePath);
+  auto root = Storage.open(folderPath.c_str());
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    siblingFiles.push_back(filePath);
+    return;
+  }
+
+  root.rewindDirectory();
+
+  char name[500];
+  for (auto file = root.openNextFile(); file; file = root.openNextFile()) {
+    file.getName(name, sizeof(name));
+    if (name[0] == '.' || file.isDirectory() || strcmp(name, "System Volume Information") == 0) {
+      file.close();
+      continue;
+    }
+
+    std::string_view filename{name};
+    if (FsHelpers::hasBmpExtension(filename)) {
+      if (folderPath == "/") {
+        siblingFiles.emplace_back("/" + std::string(filename));
+      } else {
+        siblingFiles.emplace_back(folderPath + "/" + std::string(filename));
+      }
+    }
+    file.close();
+  }
+  root.close();
+
+  FsHelpers::sortFileList(siblingFiles);
+
+  currentIndex = findEntry(filePath);
+}
+
+size_t BmpViewerActivity::findEntry(const std::string& name) const {
+  for (size_t i = 0; i < siblingFiles.size(); i++)
+    if (siblingFiles[i] == name) return i;
+  return 0;
+}
+
+bool BmpViewerActivity::selectAdjacentFile(int direction) {
+  if (siblingFiles.size() <= 1) {
+    return false;
+  }
+
+  const auto size = static_cast<int>(siblingFiles.size());
+  const auto nextIndex = (static_cast<int>(currentIndex) + direction + size) % size;
+  if (nextIndex == static_cast<int>(currentIndex)) {
+    return false;
+  }
+
+  currentIndex = static_cast<size_t>(nextIndex);
+  filePath = siblingFiles[currentIndex];
+  return true;
+}
+
 void BmpViewerActivity::onEnter() {
   Activity::onEnter();
+  loadSiblingFiles();
+  renderCurrentImage();
+}
+
+void BmpViewerActivity::renderCurrentImage() const {
   // Removed the redundant initial renderer.clearScreen()
 
   FsFile file;
@@ -49,7 +117,9 @@ void BmpViewerActivity::onEnter() {
       }
 
       // 4. Prepare Rendering
-      const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+      const bool hasAdjacentFiles = siblingFiles.size() > 1;
+      const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", hasAdjacentFiles ? tr(STR_DIR_UP) : "",
+                                                hasAdjacentFiles ? tr(STR_DIR_DOWN) : "");
       GUI.fillPopupProgress(renderer, popupRect, 50);
 
       renderer.clearScreen();
@@ -95,6 +165,20 @@ void BmpViewerActivity::loop() {
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     activityManager.goToFileBrowser(filePath);
+    return;
+  }
+
+  if (mappedInput.wasReleased(MappedInputManager::Button::Left) || mappedInput.wasReleased(MappedInputManager::Button::Up)) {
+    if (selectAdjacentFile(-1)) {
+      renderCurrentImage();
+    }
+    return;
+  }
+
+  if (mappedInput.wasReleased(MappedInputManager::Button::Right) || mappedInput.wasReleased(MappedInputManager::Button::Down)) {
+    if (selectAdjacentFile(1)) {
+      renderCurrentImage();
+    }
     return;
   }
 }

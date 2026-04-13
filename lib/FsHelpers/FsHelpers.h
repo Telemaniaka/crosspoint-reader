@@ -2,6 +2,7 @@
 #include <WString.h>
 
 #include <string>
+#include <vector>
 #include <string_view>
 
 namespace FsHelpers {
@@ -56,5 +57,7 @@ inline bool hasTxtExtension(const String& fileName) {
 bool hasMarkdownExtension(std::string_view fileName);
 
 std::string extractFolderPath(const std::string& filePath);
+
+void sortFileList(std::vector<std::string>& strs);
 
 }  // namespace FsHelpers
