@@ -66,11 +66,10 @@ void EpubReaderFootnotesActivity::render(RenderLock&&) {
   const int hintGutterHeight = isPortraitInverted ? 50 : 0;
   const int contentY = hintGutterHeight;
 
-    // Manual centering to honor content gutters.
+  // Manual centering to honor content gutters.
   const int titleX =
       contentX + (contentWidth - renderer.getTextWidth(UI_12_FONT_ID, tr(STR_FOOTNOTES), EpdFontFamily::BOLD)) / 2;
   renderer.drawText(UI_12_FONT_ID, titleX, 15 + contentY, tr(STR_FOOTNOTES), true, EpdFontFamily::BOLD);
-
 
   if (footnotes.empty()) {
     renderer.drawText(UI_10_FONT_ID, titleX, 90 + contentY, tr(STR_NO_FOOTNOTES));
