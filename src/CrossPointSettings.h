@@ -64,6 +64,7 @@ class CrossPointSettings {
     XTC_STATUS_BAR_TOP = 2,
     XTC_STATUS_BAR_MODE_COUNT
   };
+  enum XTC_RENDER_QUALITY { XTC_RENDER_FAST = 0, XTC_RENDER_QUALITY_HIGH = 1, XTC_RENDER_QUALITY_COUNT };
 
   enum ORIENTATION {
     PORTRAIT = 0,       // 480x800 logical coordinates (current default)
@@ -177,6 +178,7 @@ class CrossPointSettings {
   uint8_t statusBarTitle = CHAPTER_TITLE;
   uint8_t statusBarBattery = 1;
   uint8_t xtcStatusBarMode = XTC_STATUS_BAR_HIDE;
+  uint8_t xtcRenderQuality = XTC_RENDER_FAST;
   // Clock display in status bar (X3 only, requires DS3231 RTC)
   uint8_t statusBarClock = 0;
   // Clock UTC offset in quarter-hour steps, biased by 48 so it fits in uint8_t.

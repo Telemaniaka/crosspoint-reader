@@ -73,7 +73,7 @@ void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen
   einkDisplay.refreshDisplay(convertRefreshMode(mode), turnOffScreen);
 }
 
-void HalDisplay::deepSleep() { einkDisplay.deepSleep(); }
+void HalDisplay::deepSleep(const bool powerDownDisplay) { einkDisplay.deepSleep(powerDownDisplay); }
 
 uint8_t* HalDisplay::getFrameBuffer() const { return einkDisplay.getFrameBuffer(); }
 
@@ -87,7 +87,17 @@ void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay
 
 void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
 
-void HalDisplay::displayGrayBuffer(bool turnOffScreen) { einkDisplay.displayGrayBuffer(turnOffScreen); }
+void HalDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* lut, bool factoryMode) {
+  einkDisplay.displayGrayBuffer(turnOffScreen, lut, factoryMode);
+}
+
+void HalDisplay::displayGrayBufferFactorySetup(const unsigned char* lut) {
+  einkDisplay.displayGrayBufferFactorySetup(lut);
+}
+
+void HalDisplay::displayGrayBufferFactoryActivate() { einkDisplay.displayGrayBufferFactoryActivate(); }
+
+void HalDisplay::displayBufferPrecondition(uint8_t color) { einkDisplay.displayBufferPrecondition(color); }
 
 uint16_t HalDisplay::getDisplayWidth() const { return einkDisplay.getDisplayWidth(); }
 

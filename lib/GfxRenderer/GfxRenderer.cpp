@@ -1,5 +1,6 @@
 #include "GfxRenderer.h"
 
+#include <EInkDisplay.h>
 #include <FontDecompressor.h>
 #include <HalGPIO.h>
 #include <Logging.h>
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 
+#include "BitmapHelpers.h"
 #include "FontCacheManager.h"
 
 namespace {
@@ -20,6 +22,28 @@ const char* resolveVisualText(const char* text, std::string& visualBuffer, int p
  */
 uint8_t resolveSdCardStyle(const SdCardFont& font, const EpdFontFamily::Style style) {
   return font.resolveStyle(static_cast<uint8_t>(style));
+}
+
+// Bundles every panel-level value derived from a caller-facing GrayscaleDriveMode,
+// so the three grayscale entry points share one mapping instead of repeating ternaries.
+struct GrayscaleDriveSpec {
+  GfxRenderer::RenderMode lsbMode;
+  GfxRenderer::RenderMode msbMode;
+  const unsigned char* lut;  // nullptr for Differential
+  bool factoryMode;
+  bool differentialQuantize;
+};
+
+GrayscaleDriveSpec resolveGrayscaleDrive(GfxRenderer::GrayscaleDriveMode mode) {
+  switch (mode) {
+    case GfxRenderer::GrayscaleDriveMode::Differential:
+      return {GfxRenderer::GRAYSCALE_LSB, GfxRenderer::GRAYSCALE_MSB, nullptr, false, true};
+    case GfxRenderer::GrayscaleDriveMode::FactoryFast:
+      return {GfxRenderer::GRAY2_LSB, GfxRenderer::GRAY2_MSB, lut_factory_fast, true, false};
+    case GfxRenderer::GrayscaleDriveMode::FactoryQuality:
+      return {GfxRenderer::GRAY2_LSB, GfxRenderer::GRAY2_MSB, lut_factory_quality, true, false};
+  }
+  return {GfxRenderer::GRAYSCALE_LSB, GfxRenderer::GRAYSCALE_MSB, nullptr, false, true};
 }
 }  // namespace
 
@@ -194,7 +218,15 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
             // We have to flag pixels in reverse for the gray buffers, as 0 leave alone, 1 update
             renderer.drawPixel(screenX, screenY, false);
           } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && bmpVal == 1) {
-            // Dark gray
+            // Differential LSB: mark dark gray pixels only
+            renderer.drawPixel(screenX, screenY, false);
+          } else if (renderMode == GfxRenderer::GRAY2_LSB && !(bmpVal & 1)) {
+            // Factory absolute LSB (BW RAM): set BW=1 for Black(0) and LightGrey(2)
+            // clearScreen(0x00) base; drawPixel(false) sets bit to 1
+            renderer.drawPixel(screenX, screenY, false);
+          } else if (renderMode == GfxRenderer::GRAY2_MSB && bmpVal < 2) {
+            // Factory absolute MSB (RED RAM): set RED=1 for Black(0) and DarkGrey(1)
+            // clearScreen(0x00) base; drawPixel(false) sets bit to 1
             renderer.drawPixel(screenX, screenY, false);
           }
         }
@@ -217,7 +249,11 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
           const uint8_t bit_index = 7 - (pixelPosition & 7);
 
           if ((byte >> bit_index) & 1) {
-            renderer.drawPixel(screenX, screenY, pixelState);
+            // In GRAY2 modes the framebuffer convention is inverted vs BW: clearScreen(0x00) is
+            // background and drawPixel(false) marks active pixels. BW-convention callers pass
+            // pixelState=true for "black" — invert here so 1-bit UI glyphs stay visible.
+            const bool gray2 = renderMode == GfxRenderer::GRAY2_LSB || renderMode == GfxRenderer::GRAY2_MSB;
+            renderer.drawPixel(screenX, screenY, gray2 ? !pixelState : pixelState);
           }
         }
       }
@@ -236,7 +272,7 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
 
   // Bounds checking against runtime panel dimensions
   if (phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) {
-    LOG_ERR("GFX", "!! Outside range (%d, %d) -> (%d, %d)", x, y, phyX, phyY);
+    LOG_DBG("GFX", "!! Outside range (%d, %d) -> (%d, %d)", x, y, phyX, phyY);
     return;
   }
 
@@ -246,9 +282,33 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
 
   if (state) {
     frameBuffer[byteIndex] &= ~(1 << bitPosition);  // Clear bit
+    // Single-pass: erasing a pixel must also clear the MSB plane so UI white fills (e.g. button
+    // hint backgrounds drawn on top of a full-screen image) fully erase image bits from both
+    // planes. Without this, image pixels remain in RED RAM and bleed through white areas.
+    if (renderMode == GRAY2_LSB && secondaryFrameBuffer != nullptr) {
+      secondaryFrameBuffer[byteIndex] &= ~(1 << bitPosition);
+    }
   } else {
     frameBuffer[byteIndex] |= 1 << bitPosition;  // Set bit
+    // Single-pass: all set-bit draws in GRAY2_LSB mode (1-bit UI elements, text, icons) are
+    // treated as fully black and mirrored to the MSB plane so they don't render as light gray.
+    // Image pixels skip drawPixel and go through drawPixelToBuffer directly (see drawBitmap),
+    // so this path is only hit by 1-bit rendering (renderChar, drawIcon, etc.).
+    if (renderMode == GRAY2_LSB && secondaryFrameBuffer != nullptr) {
+      secondaryFrameBuffer[byteIndex] |= 1 << bitPosition;
+    }
   }
+}
+
+// Writes a single pixel (always state=false / set bit) to an arbitrary buffer using the same
+// orientation transform as drawPixel. Used by single-pass grayscale to write the MSB plane
+// simultaneously with the LSB plane during a single renderFn call.
+void GfxRenderer::drawPixelToBuffer(uint8_t* buf, const int x, const int y) const {
+  int phyX = 0, phyY = 0;
+  rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
+  if (phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) return;
+  const uint32_t byteIndex = static_cast<uint32_t>(phyY) * panelWidthBytes + (phyX / 8);
+  buf[byteIndex] |= 1 << (7 - (phyX % 8));
 }
 
 int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontFamily::Style style) const {
@@ -332,19 +392,22 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
 
 void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, const bool state) const {
   if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
+  // In GRAY2 modes the framebuffer convention is inverted vs BW: clearScreen(0x00) is background
+  // and drawPixel(false) marks active pixels. BW-convention callers pass state=true for "black".
+  const bool s = (renderMode == GRAY2_LSB || renderMode == GRAY2_MSB) ? !state : state;
   if (x1 == x2) {
     if (y2 < y1) {
       std::swap(y1, y2);
     }
     for (int y = y1; y <= y2; y++) {
-      drawPixel(x1, y, state);
+      drawPixel(x1, y, s);
     }
   } else if (y1 == y2) {
     if (x2 < x1) {
       std::swap(x1, x2);
     }
     for (int x = x1; x <= x2; x++) {
-      drawPixel(x, y1, state);
+      drawPixel(x, y1, s);
     }
   } else {
     // Bresenham's line algorithm — integer arithmetic only
@@ -357,7 +420,7 @@ void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, const bool state) con
 
     int err = dx - dy;
     while (true) {
-      drawPixel(x1, y1, state);
+      drawPixel(x1, y1, s);
       if (x1 == x2 && y1 == y2) break;
       int e2 = 2 * err;
       if (e2 > -dy) {
@@ -409,6 +472,8 @@ void GfxRenderer::drawArc(const int maxRadius, const int cx, const int cy, const
   const int outerRadiusSq = outerRadius * outerRadius;
   const int innerRadiusSq = innerRadius * innerRadius;
 
+  // Do NOT pre-invert state for GRAY2 here: fillRect→drawLine already handles the GRAY2
+  // inversion. A pre-inversion here would double-invert (cancel out), rendering the wrong color.
   int xOuter = outerRadius;
   int xInner = innerRadius;
 
@@ -511,22 +576,28 @@ void GfxRenderer::drawPixelDither<Color::Clear>(const int x, const int y) const 
 
 template <>
 void GfxRenderer::drawPixelDither<Color::Black>(const int x, const int y) const {
-  drawPixel(x, y, true);
+  const bool gray2 = renderMode == GRAY2_LSB || renderMode == GRAY2_MSB;
+  drawPixel(x, y, !gray2);
 }
 
 template <>
 void GfxRenderer::drawPixelDither<Color::White>(const int x, const int y) const {
-  drawPixel(x, y, false);
+  const bool gray2 = renderMode == GRAY2_LSB || renderMode == GRAY2_MSB;
+  drawPixel(x, y, gray2);
 }
 
 template <>
 void GfxRenderer::drawPixelDither<Color::LightGray>(const int x, const int y) const {
-  drawPixel(x, y, x % 2 == 0 && y % 2 == 0);
+  const bool pix = x % 2 == 0 && y % 2 == 0;
+  const bool gray2 = renderMode == GRAY2_LSB || renderMode == GRAY2_MSB;
+  drawPixel(x, y, gray2 ? !pix : pix);
 }
 
 template <>
 void GfxRenderer::drawPixelDither<Color::DarkGray>(const int x, const int y) const {
-  drawPixel(x, y, (x + y) % 2 == 0);  // TODO: maybe find a better pattern?
+  const bool pix = (x + y) % 2 == 0;  // TODO: maybe find a better pattern?
+  const bool gray2 = renderMode == GRAY2_LSB || renderMode == GRAY2_MSB;
+  drawPixel(x, y, gray2 ? !pix : pix);
 }
 
 void GfxRenderer::fillRectDither(const int x, const int y, const int width, const int height, Color color) const {
@@ -775,12 +846,88 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
     return;
   }
 
+  // --- Pre-compute everything that is constant for the entire render ---
+
+  // Orientation: collapse into 6 integer coefficients (same approach as DirectPixelWriter).
+  // phyX = phyXBase + screenY*phyXStepY + screenX*phyXStepX
+  // phyY = phyYBase + screenY*phyYStepY + screenX*phyYStepX
+  int phyXBase, phyYBase, phyXStepX, phyYStepX, phyXStepY, phyYStepY;
+  switch (orientation) {
+    case Portrait:
+      phyXBase = 0;
+      phyYBase = panelHeight - 1;
+      phyXStepX = 0;
+      phyYStepX = -1;
+      phyXStepY = 1;
+      phyYStepY = 0;
+      break;
+    case LandscapeClockwise:
+      phyXBase = panelWidth - 1;
+      phyYBase = panelHeight - 1;
+      phyXStepX = -1;
+      phyYStepX = 0;
+      phyXStepY = 0;
+      phyYStepY = -1;
+      break;
+    case PortraitInverted:
+      phyXBase = panelWidth - 1;
+      phyYBase = 0;
+      phyXStepX = 0;
+      phyYStepX = 1;
+      phyXStepY = -1;
+      phyYStepY = 0;
+      break;
+    case LandscapeCounterClockwise:
+    default:
+      phyXBase = 0;
+      phyYBase = 0;
+      phyXStepX = 1;
+      phyYStepX = 0;
+      phyXStepY = 0;
+      phyYStepY = 1;
+      break;
+  }
+
+  // Per-val write masks (val is 2-bit: 0=black,1=darkGrey,2=lightGrey,3=white).
+  // Bit i of the mask is set when val==i should trigger a write.
+  // Evaluated once here; zero branch overhead inside the pixel loop.
+  uint8_t writeFbMask = 0;   // which val values write to frameBuffer
+  uint8_t writeFb2Mask = 0;  // which val values write to secondaryFrameBuffer (GRAY2_LSB single-pass only)
+  bool fbClearBit = false;   // true = clear bit (BW black); false = set bit (all gray modes)
+  uint8_t* const fb2 = secondaryFrameBuffer;
+
+  switch (renderMode) {
+    case BW:
+      writeFbMask = 0x3;
+      fbClearBit = true;
+      break;  // val 0,1 (black+darkGrey)
+    case GRAYSCALE_MSB:
+      writeFbMask = 0x6;
+      break;  // val 1,2
+    case GRAYSCALE_LSB:
+      writeFbMask = 0x2;
+      break;  // val 1
+    case GRAY2_LSB:
+      writeFbMask = 0x5;  // val 0,2 (LSB plane)
+      if (fb2) writeFb2Mask = 0x3;
+      break;  // val 0,1 (MSB plane)
+    case GRAY2_MSB:
+      writeFbMask = 0x3;
+      break;  // val 0,1
+    default:
+      break;
+  }
+
+  // Pre-computed for the unscaled incremental inner loop: stride through the physical Y axis per logical X step.
+  const int32_t byteIdxYStep = static_cast<int32_t>(phyYStepX) * static_cast<int32_t>(panelWidthBytes);
+
+  // --- Outer row loop ---
   for (int bmpY = 0; bmpY < (bitmap.getHeight() - cropPixY); bmpY++) {
     // The BMP's (0, 0) is the bottom-left corner (if the height is positive, top-left if negative).
     // Screen's (0, 0) is the top-left corner.
     int screenY = -cropPixY + (bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY);
     if (isScaled) {
-      screenY = std::floor(screenY * scale);
+      screenY = static_cast<int>(std::floor(screenY * scale));
     }
     screenY += y;  // the offset should not be scaled
     if (screenY >= getScreenHeight()) {
@@ -803,27 +950,63 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       continue;
     }
 
-    for (int bmpX = cropPixX; bmpX < bitmap.getWidth() - cropPixX; bmpX++) {
-      int screenX = bmpX - cropPixX;
-      if (isScaled) {
-        screenX = std::floor(screenX * scale);
-      }
-      screenX += x;  // the offset should not be scaled
-      if (screenX >= getScreenWidth()) {
-        break;
-      }
-      if (screenX < 0) {
-        continue;
-      }
+    // Pre-compute the Y-dependent portion of the physical coordinate transform once per row.
+    const int rowPhyXBase = phyXBase + screenY * phyXStepY;
+    const int rowPhyYBase = phyYBase + screenY * phyYStepY;
 
-      const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
+    if (isScaled) {
+      // Scaled path: float accumulator replaces per-column multiply.
+      // Integer coordinate multiplies remain but are rare (scaled images only).
+      float screenXF = static_cast<float>(x);
+      for (int bmpX = cropPixX; bmpX < bitmap.getWidth() - cropPixX; bmpX++, screenXF += scale) {
+        const int screenX = static_cast<int>(screenXF);
+        if (screenX >= getScreenWidth()) break;
+        if (screenX < 0) continue;
 
-      if (renderMode == BW && val < 3) {
-        drawPixel(screenX, screenY);
-      } else if (renderMode == GRAYSCALE_MSB && (val == 1 || val == 2)) {
-        drawPixel(screenX, screenY, false);
-      } else if (renderMode == GRAYSCALE_LSB && val == 1) {
-        drawPixel(screenX, screenY, false);
+        const uint8_t val = (outputRow[bmpX >> 2] >> (6 - (bmpX & 3) * 2)) & 0x3;
+        const bool doFb = (writeFbMask >> val) & 1;
+        const bool doFb2 = (writeFb2Mask >> val) & 1;
+        if (!doFb && !doFb2) continue;
+
+        const int phyX = rowPhyXBase + screenX * phyXStepX;
+        const int phyY = rowPhyYBase + screenX * phyYStepX;
+        const uint32_t byteIdx = static_cast<uint32_t>(phyY) * panelWidthBytes + (phyX >> 3);
+        const uint8_t bitMask = 1 << (7 - (phyX & 7));
+        if (doFb) {
+          if (fbClearBit)
+            frameBuffer[byteIdx] &= ~bitMask;
+          else
+            frameBuffer[byteIdx] |= bitMask;
+        }
+        if (doFb2) fb2[byteIdx] |= bitMask;
+      }
+    } else {
+      // Unscaled path: fully incremental — zero multiplies, zero float in the pixel loop.
+      // curPhyX and curByteIdxY start at screenX=x (when bmpX=cropPixX) and advance by
+      // phyXStepX / byteIdxYStep per column. The for-increment fires on every iteration
+      // including continue, so running state stays in sync with bmpX even for skipped pixels.
+      int curPhyX = rowPhyXBase + x * phyXStepX;
+      int32_t curByteIdx = static_cast<int32_t>(rowPhyYBase + x * phyYStepX) * static_cast<int32_t>(panelWidthBytes);
+      for (int bmpX = cropPixX; bmpX < bitmap.getWidth() - cropPixX;
+           bmpX++, curPhyX += phyXStepX, curByteIdx += byteIdxYStep) {
+        const int screenX = bmpX - cropPixX + x;
+        if (screenX >= getScreenWidth()) break;
+        if (screenX < 0) continue;
+
+        const uint8_t val = (outputRow[bmpX >> 2] >> (6 - (bmpX & 3) * 2)) & 0x3;
+        const bool doFb = (writeFbMask >> val) & 1;
+        const bool doFb2 = (writeFb2Mask >> val) & 1;
+        if (!doFb && !doFb2) continue;
+
+        const uint32_t byteIdx = static_cast<uint32_t>(curByteIdx) + static_cast<uint32_t>(curPhyX >> 3);
+        const uint8_t bitMask = 1 << (7 - (curPhyX & 7));
+        if (doFb) {
+          if (fbClearBit)
+            frameBuffer[byteIdx] &= ~bitMask;
+          else
+            frameBuffer[byteIdx] |= bitMask;
+        }
+        if (doFb2) fb2[byteIdx] |= bitMask;
       }
     }
   }
@@ -888,10 +1071,13 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
       // Get 2-bit value (result of readNextRow quantization)
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
 
-      // For 1-bit source: 0 or 1 -> map to black (0,1,2) or white (3)
-      // val < 3 means black pixel (draw it)
+      // For 1-bit source: val < 3 = black, val == 3 = white
       if (val < 3) {
-        drawPixel(screenX, screenY, true);
+        if (renderMode == GRAY2_LSB || renderMode == GRAY2_MSB) {
+          drawPixel(screenX, screenY, false);
+        } else {
+          drawPixel(screenX, screenY, true);
+        }
       }
       // White pixels (val == 3) are not drawn (leave background)
     }
@@ -969,6 +1155,11 @@ void GfxRenderer::clearScreen(const uint8_t color) const {
   display.clearScreen(color);
 }
 
+void GfxRenderer::setScreenshotHook(ScreenshotHook hook, void* ctx) {
+  screenshotHook = hook;
+  screenshotHookCtx = ctx;
+}
+
 void GfxRenderer::invertScreen() const {
   for (uint32_t i = 0; i < frameBufferSize; i++) {
     frameBuffer[i] = ~frameBuffer[i];
@@ -978,7 +1169,28 @@ void GfxRenderer::invertScreen() const {
 void GfxRenderer::displayBuffer(const HalDisplay::RefreshMode refreshMode) const {
   auto elapsed = millis() - start_ms;
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
-  display.displayBuffer(refreshMode, fadingFix);
+  // After a factory LUT render, RED RAM still contains the grayscale MSB plane.
+  // Promote the first normal FAST refresh to HALF so both RAM banks are rebased
+  // before differential updates resume.
+  const bool afterFactoryLut = displayState == DisplayState::FactoryLut;
+  const auto effectiveRefreshMode =
+      afterFactoryLut && refreshMode == HalDisplay::FAST_REFRESH ? HalDisplay::HALF_REFRESH : refreshMode;
+  display.displayBuffer(effectiveRefreshMode, fadingFix);
+  displayState = DisplayState::BW;
+}
+
+void GfxRenderer::displayBufferPrecondition(uint8_t color) const {
+  display.displayBufferPrecondition(color);
+  displayState = DisplayState::BW;
+}
+
+void GfxRenderer::displayGrayBuffer(const unsigned char* lut, const bool factoryMode) const {
+  display.displayGrayBuffer(fadingFix, lut, factoryMode);
+  if (factoryMode) {
+    displayState = DisplayState::FactoryLut;
+  } else {
+    displayState = DisplayState::BW;
+  }
 }
 
 std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,
@@ -1368,7 +1580,249 @@ void GfxRenderer::copyGrayscaleLsbBuffers() const { display.copyGrayscaleLsbBuff
 
 void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuffers(frameBuffer); }
 
-void GfxRenderer::displayGrayBuffer() const { display.displayGrayBuffer(fadingFix); }
+void GfxRenderer::renderGrayscale(GrayscaleDriveMode mode, void (*renderFn)(const GfxRenderer&, const void*),
+                                  const void* ctx, void (*preFlashOverlayFn)(const GfxRenderer&, const void*),
+                                  const void* preFlashCtx) {
+  const auto spec = resolveGrayscaleDrive(mode);
+
+  if (spec.factoryMode) {
+    clearScreen();
+    if (preFlashOverlayFn) preFlashOverlayFn(*this, preFlashCtx);
+    displayBuffer(HalDisplay::HALF_REFRESH);
+  }
+
+  g_differentialQuantize = spec.differentialQuantize;
+
+  clearScreen(0x00);
+  setRenderMode(spec.lsbMode);
+  renderFn(*this, ctx);
+
+  uint8_t* lsbCopy = nullptr;
+  if (screenshotHook && spec.factoryMode) {
+    lsbCopy = static_cast<uint8_t*>(malloc(frameBufferSize));
+    if (lsbCopy) {
+      memcpy(lsbCopy, frameBuffer, frameBufferSize);
+    } else {
+      // Allocation failed — disarm the one-shot hook so it doesn't fire on a future render.
+      screenshotHook = nullptr;
+      screenshotHookCtx = nullptr;
+    }
+  }
+
+  // Match stock SPI order for factory mode: setCustomLUT + Border BEFORE the
+  // RAM writes. Differential path skips Setup (handled by displayGrayBuffer at
+  // the end). See docs/v559-disassembly-findings.md Difference #4.
+  if (spec.factoryMode) {
+    display.displayGrayBufferFactorySetup(spec.lut);
+  }
+  copyGrayscaleLsbBuffers();
+
+  clearScreen(0x00);
+  setRenderMode(spec.msbMode);
+  renderFn(*this, ctx);
+  copyGrayscaleMsbBuffers();
+
+  // Fire hook: LSB = lsbCopy, MSB = frameBuffer (still holds second-pass data).
+  if (screenshotHook && spec.factoryMode && lsbCopy) {
+    screenshotHook(lsbCopy, frameBuffer, panelWidth, panelHeight, screenshotHookCtx);
+    screenshotHook = nullptr;
+    screenshotHookCtx = nullptr;
+  }
+  if (lsbCopy) {
+    free(lsbCopy);
+    lsbCopy = nullptr;
+  }
+
+  g_differentialQuantize = false;
+
+  // Factory mode: differential path keeps the original combined call. Factory
+  // path uses the split SDK API so the LUT load happens BEFORE RAM writes —
+  // matches stock V5.5.9 SPI order. Same pattern as renderGrayscaleSinglePass.
+  if (spec.factoryMode) {
+    display.displayGrayBufferFactoryActivate();
+  } else {
+    displayGrayBuffer(spec.lut, spec.factoryMode);
+  }
+  // Suppress the SDK's automatic grayscaleRevert on the next BW page turn.
+  // Caller is responsible for cleanup: restoreBwBuffer rebases RED RAM, and
+  // displayBuffer promotes the first post-factory FAST refresh to HALF.
+  display.clearGrayscaleModeFlag();
+  setRenderMode(BW);
+}
+
+void GfxRenderer::renderGrayscaleSinglePass(GrayscaleDriveMode mode, void (*renderFn)(const GfxRenderer&, const void*),
+                                            const void* ctx, void (*preFlashOverlayFn)(const GfxRenderer&, const void*),
+                                            const void* preFlashCtx, const HalDisplay::RefreshMode preFlashRefreshMode,
+                                            const uint8_t preFlashPasses) {
+  const auto spec = resolveGrayscaleDrive(mode);
+
+  if (spec.factoryMode && preFlashPasses > 0) {
+    for (uint8_t pass = 0; pass < preFlashPasses; pass++) {
+      clearScreen();
+      if (pass == 0 && preFlashOverlayFn) preFlashOverlayFn(*this, preFlashCtx);
+      displayBuffer(preFlashRefreshMode);
+    }
+  }
+
+  g_differentialQuantize = spec.differentialQuantize;
+
+  auto* secBuf = static_cast<uint8_t*>(malloc(frameBufferSize));
+  if (!secBuf) {
+    LOG_ERR("GFX", "renderGrayscaleSinglePass: malloc failed (%lu bytes), falling back to two-pass",
+            static_cast<unsigned long>(frameBufferSize));
+    screenshotHook = nullptr;
+    screenshotHookCtx = nullptr;
+    clearScreen(0x00);
+    setRenderMode(spec.lsbMode);
+    renderFn(*this, ctx);
+    copyGrayscaleLsbBuffers();
+    clearScreen(0x00);
+    setRenderMode(spec.msbMode);
+    renderFn(*this, ctx);
+    copyGrayscaleMsbBuffers();
+    g_differentialQuantize = false;
+    displayGrayBuffer(spec.lut, spec.factoryMode);
+    // See note in renderGrayscale().
+    display.clearGrayscaleModeFlag();
+    setRenderMode(BW);
+    return;
+  }
+  memset(secBuf, 0x00, frameBufferSize);
+  secondaryFrameBuffer = secBuf;
+
+  // Single pass: renderFn writes LSB plane to frameBuffer and MSB plane to secondaryFrameBuffer.
+  clearScreen(0x00);
+  setRenderMode(spec.lsbMode);
+  renderFn(*this, ctx);
+
+  // One-shot screenshot hook: fired while both planes are still in software, before either is
+  // pushed to the controller. frameBuffer = LSB plane, secBuf = MSB plane.
+  if (screenshotHook && spec.factoryMode) {
+    screenshotHook(frameBuffer, secBuf, panelWidth, panelHeight, screenshotHookCtx);
+    screenshotHook = nullptr;
+    screenshotHookCtx = nullptr;
+  }
+
+  // EXPERIMENT: match stock V5.5.9 SPI order: LUT load → RAM writes → activate.
+  // For factory mode, use the split SDK API so RAM data is written AFTER setCustomLUT
+  // and Border Waveform, BEFORE the MASTER_ACTIVATION. See docs/v559-disassembly-findings.md.
+  if (spec.factoryMode) {
+    display.displayGrayBufferFactorySetup(spec.lut);
+    copyGrayscaleLsbBuffers();
+    memcpy(frameBuffer, secBuf, frameBufferSize);
+    copyGrayscaleMsbBuffers();
+    free(secBuf);
+    secondaryFrameBuffer = nullptr;
+    g_differentialQuantize = false;
+    display.displayGrayBufferFactoryActivate();
+    display.clearGrayscaleModeFlag();
+    setRenderMode(BW);
+    return;
+  }
+
+  // Differential path: original order (RAM writes then combined displayGrayBuffer).
+  copyGrayscaleLsbBuffers();
+  memcpy(frameBuffer, secBuf, frameBufferSize);
+  copyGrayscaleMsbBuffers();
+
+  free(secBuf);
+  secondaryFrameBuffer = nullptr;
+
+  g_differentialQuantize = false;
+  displayGrayBuffer(spec.lut, spec.factoryMode);
+  display.clearGrayscaleModeFlag();
+  setRenderMode(BW);
+}
+
+void GfxRenderer::displayXtchPlanes(const uint8_t* plane1, const uint8_t* plane2, const uint16_t pageWidth,
+                                    const uint16_t pageHeight, RenderHook overlayFn, const void* overlayCtx,
+                                    GrayscaleDriveMode mode, const bool preFlash,
+                                    const HalDisplay::RefreshMode preFlashRefreshMode, const uint8_t preFlashPasses) {
+  const size_t colBytes = (pageHeight + 7) / 8;
+  const uint16_t fbStride = panelWidthBytes;
+
+  // Bounds check: each column c writes colBytes bytes at frameBuffer[c * fbStride].
+  // Requires pageWidth <= panelHeight and colBytes <= panelWidthBytes.
+  if (pageWidth > static_cast<uint16_t>(panelHeight) || colBytes > panelWidthBytes) {
+    LOG_ERR("GFX", "displayXtchPlanes: page %ux%u overflows framebuffer (%ux%u)", pageWidth, pageHeight, panelHeight,
+            panelWidth);
+    if (screenshotHook) {
+      screenshotHook = nullptr;
+      screenshotHookCtx = nullptr;
+    }
+    return;
+  }
+
+  if (preFlash && preFlashPasses > 0) {
+    for (uint8_t pass = 0; pass < preFlashPasses; pass++) {
+      clearScreen();
+      displayBuffer(preFlashRefreshMode);
+    }
+  }
+
+  // Match stock V5.5.9 SPI order: setCustomLUT + Border BEFORE RAM writes.
+  // Resolve drive spec early so we can use Setup/Activate. See
+  // docs/v559-disassembly-findings.md Difference #4.
+  const auto spec = resolveGrayscaleDrive(mode);
+  display.displayGrayBufferFactorySetup(spec.lut);
+
+  // Pass 1: plane1 (MSB) → BW RAM via copyGrayscaleLsbBuffers.
+  clearScreen(0x00);
+  for (uint16_t c = 0; c < pageWidth; c++) {
+    const uint8_t* srcCol = plane1 + static_cast<uint32_t>(c) * colBytes;
+    uint8_t* dstRow = frameBuffer + static_cast<uint32_t>(c) * fbStride;
+    for (uint16_t b = 0; b < colBytes; b++) {
+      dstRow[b] = srcCol[b];
+    }
+  }
+  setRenderMode(GRAY2_LSB);
+  if (overlayFn) overlayFn(*this, overlayCtx);
+
+  copyGrayscaleLsbBuffers();
+
+  // Pass 2: plane2 (LSB) → RED RAM via copyGrayscaleMsbBuffers.
+  clearScreen(0x00);
+  for (uint16_t c = 0; c < pageWidth; c++) {
+    const uint8_t* srcCol = plane2 + static_cast<uint32_t>(c) * colBytes;
+    uint8_t* dstRow = frameBuffer + static_cast<uint32_t>(c) * fbStride;
+    for (uint16_t b = 0; b < colBytes; b++) {
+      dstRow[b] = srcCol[b];
+    }
+  }
+  setRenderMode(GRAY2_MSB);
+  if (overlayFn) overlayFn(*this, overlayCtx);
+  copyGrayscaleMsbBuffers();
+
+  // Fire hook: plane1 input IS already in framebuffer format (colBytes == fbStride for portrait
+  // pages), so pass it directly — no extra malloc needed. plane2 data is now in frameBuffer.
+  if (screenshotHook) {
+    screenshotHook(plane1, frameBuffer, panelWidth, panelHeight, screenshotHookCtx);
+    screenshotHook = nullptr;
+    screenshotHookCtx = nullptr;
+  }
+
+  display.displayGrayBufferFactoryActivate();
+  setRenderMode(BW);
+}
+
+void GfxRenderer::displayXtcBwPage(const uint8_t* pageBuffer, const uint16_t pageWidth, const uint16_t pageHeight,
+                                   const HalDisplay::RefreshMode refreshMode, RenderHook overlayFn,
+                                   const void* overlayCtx) {
+  const size_t srcRowBytes = (pageWidth + 7) / 8;
+
+  // 1-bit content has no AA — render as plain BW and use the standard differential fast-refresh
+  // LUT (same as menus/EPUB). No factory LUT needed; avoids all GRAY2 convention complexity.
+  clearScreen();
+  for (uint16_t y = 0; y < pageHeight; y++) {
+    for (uint16_t x = 0; x < pageWidth; x++) {
+      if (!((pageBuffer[y * srcRowBytes + x / 8] >> (7 - (x % 8))) & 1)) {
+        drawPixel(x, y, true);
+      }
+    }
+  }
+  if (overlayFn) overlayFn(*this, overlayCtx);
+  displayBuffer(refreshMode);
+}
 
 void GfxRenderer::freeBwBufferChunks() {
   for (auto& bwBufferChunk : bwBufferChunks) {

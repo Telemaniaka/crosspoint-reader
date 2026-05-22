@@ -42,7 +42,7 @@ class HalDisplay {
   void refreshDisplay(RefreshMode mode = RefreshMode::FAST_REFRESH, bool turnOffScreen = false);
 
   // Power management
-  void deepSleep();
+  void deepSleep(bool powerDownDisplay = true);
 
   // Access to frame buffer
   uint8_t* getFrameBuffer() const;
@@ -52,7 +52,17 @@ class HalDisplay {
   void copyGrayscaleMsbBuffers(const uint8_t* msbBuffer);
   void cleanupGrayscaleBuffers(const uint8_t* bwBuffer);
 
-  void displayGrayBuffer(bool turnOffScreen = false);
+  void displayGrayBuffer(bool turnOffScreen = false, const unsigned char* lut = nullptr, bool factoryMode = false);
+  // Two-phase factory grayscale render — see EInkDisplay.h.
+  void displayGrayBufferFactorySetup(const unsigned char* lut);
+  void displayGrayBufferFactoryActivate();
+  // Stock-V5.5.9 byte-match precondition (black/white full power-cycle flash).
+  void displayBufferPrecondition(uint8_t color);
+
+  // Tell the SDK that grayscale state has been cleaned up by the consumer
+  // (RAM banks rebased + a follow-up FAST_REFRESH will handle pixel cleanup),
+  // so the next displayBuffer() should not run grayscaleRevert().
+  void clearGrayscaleModeFlag() { einkDisplay.clearGrayscaleModeFlag(); }
 
   // Runtime geometry passthrough
   uint16_t getDisplayWidth() const;
